@@ -204,3 +204,114 @@ static bool parse_uint56(const char *value, uint64_t *parsed) {
     return true;
 }
 
+/* Lee y valida las opciones recibidas desde la línea de comandos. */
+bool parse_cli_options(int argc, char **argv, CliOptions *options,
+                       char *error, size_t error_size) {
+    if (options == NULL || argv == NULL) {
+        set_error(error, error_size, "Parametros internos invalidos.");
+        return false;
+    }
+
+    CliOptions parsed = {0};
+    bool have_text = false;
+    bool have_phrase = false;
+    bool have_key = false;
+    bool have_upper = false;
+
+    for (int i = 1; i < argc; i += 2) {
+        if (i + 1 >= argc) {
+            set_error(error, error_size, "Cada opcion requiere un valor.");
+            return false;
+        }
+        const char *name = argv[i];
+        const char *value = argv[i + 1];
+        if (strcmp(name, "--text") == 0 && !have_text) {
+            parsed.text = value;
+            have_text = true;
+        } else if (strcmp(name, "--phrase") == 0 && !have_phrase) {
+            parsed.phrase = value;
+            have_phrase = true;
+        } else if (strcmp(name, "--key") == 0 && !have_key) {
+            if (!parse_uint56(value, &parsed.key)) {
+                set_error(error, error_size, "--key debe ser un entero DES valido.");
+                return false;
+            }
+            have_key = true;
+        } else if (strcmp(name, "--upper") == 0 && !have_upper) {
+            if (!parse_uint56(value, &parsed.upper)) {
+                set_error(error, error_size, "--upper debe ser un entero DES valido.");
+                return false;
+            }
+            have_upper = true;
+        } else {
+            set_error(error, error_size, "Opcion desconocida o repetida.");
+            return false;
+        }
+    }
+
+    if (!have_text || !have_phrase || !have_key || !have_upper) {
+        set_error(error, error_size, "Faltan opciones obligatorias.");
+        return false;
+    }
+    const size_t text_len = strlen(parsed.text);
+    const size_t phrase_len = strlen(parsed.phrase);
+    if (text_len == 0 || text_len > MAX_TEXT_BYTES) {
+        set_error(error, error_size, "El texto debe contener entre 1 byte y 1 MiB.");
+        return false;
+    }
+    if (phrase_len == 0 || phrase_len > text_len) {
+        set_error(error, error_size, "La frase no puede estar vacia ni superar el texto.");
+        return false;
+    }
+    if (parsed.upper == 0 || parsed.upper > DES_KEYSPACE_SIZE ||
+        parsed.key >= parsed.upper) {
+        set_error(error, error_size, "Se requiere 0 <= key < upper <= 2^56.");
+        return false;
+    }
+    *options = parsed;
+    return true;
+}
+
+/* Descifra una candidata y busca la frase indicada. */
+bool try_key(uint64_t key, const unsigned char *cipher, size_t cipher_len,
+             const char *phrase) {
+    if (cipher == NULL || cipher_len == 0 ||
+        cipher_len % DES_BLOCK_SIZE != 0 || phrase == NULL ||
+        phrase[0] == '\0' || cipher_len == SIZE_MAX) {
+        return false;
+    }
+
+    unsigned char *candidate = malloc(cipher_len + 1U);
+    if (candidate == NULL) {
+        return false;
+    }
+    memcpy(candidate, cipher, cipher_len);
+
+    size_t plain_len = 0;
+    const bool valid = decrypt_buffer(key, candidate, cipher_len) &&
+                       remove_pkcs7_padding(candidate, cipher_len, &plain_len);
+    bool matches = false;
+    if (valid) {
+        candidate[plain_len] = '\0';
+        matches = strstr((const char *)candidate, phrase) != NULL;
+    }
+    free(candidate);
+    return matches;
+}
+
+/* Recorre un rango de claves hasta encontrar una coincidencia. */
+bool search_range(uint64_t lower, uint64_t upper,
+                  const unsigned char *cipher, size_t cipher_len,
+                  const char *phrase, uint64_t *found_key) {
+    if (lower > upper || found_key == NULL) {
+        return false;
+    }
+    for (uint64_t key = lower; key < upper; ++key) {
+        if (try_key(key, cipher, cipher_len, phrase)) {
+            *found_key = key;
+            return true;
+        }
+    }
+    return false;
+}
+
