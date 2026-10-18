@@ -315,3 +315,134 @@ bool search_range(uint64_t lower, uint64_t upper,
     return false;
 }
 
+#ifndef BRUTEFORCE_CORE_TEST
+/* Muestra la forma correcta de ejecutar el programa. */
+static void print_usage(const char *program) {
+    fprintf(stderr,
+            "Uso: %s --text TEXTO --phrase FRASE --key N --upper N\n"
+            "Condicion: 0 <= key < upper <= 2^56.\n",
+            program);
+}
+
+int main(int argc, char **argv) {
+    /* Inicializa MPI y obtiene la identidad del proceso actual. */
+    if (MPI_Init(&argc, &argv) != MPI_SUCCESS) {
+        fputs("No se pudo inicializar MPI.\n", stderr);
+        return EXIT_FAILURE;
+    }
+
+    MPI_Comm comm = MPI_COMM_WORLD;
+    int rank = 0;
+    int process_count = 0;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &process_count);
+
+    CliOptions options;
+    char error[160] = {0};
+    const int local_args_ok =
+        parse_cli_options(argc, argv, &options, error, sizeof(error)) ? 1 : 0;
+    int all_args_ok = 0;
+    /* Verifica que todos los procesos reciban argumentos válidos. */
+    MPI_Allreduce(&local_args_ok, &all_args_ok, 1, MPI_INT, MPI_MIN, comm);
+    if (!all_args_ok) {
+        if (rank == 0) {
+            fprintf(stderr, "Error: %s\n", local_args_ok ?
+                    "argumentos inconsistentes entre procesos" : error);
+            print_usage(argv[0]);
+        }
+        MPI_Finalize();
+        return EXIT_FAILURE;
+    }
+
+    unsigned char *cipher = NULL;
+    size_t cipher_len = 0;
+    const int local_setup_ok =
+        pad_plaintext((const unsigned char *)options.text, strlen(options.text),
+                      &cipher, &cipher_len) &&
+        encrypt_buffer(options.key, cipher, cipher_len);
+    int all_setup_ok = 0;
+    /* Confirma que todos los procesos prepararon el texto correctamente. */
+    MPI_Allreduce(&local_setup_ok, &all_setup_ok, 1, MPI_INT, MPI_MIN, comm);
+    if (!all_setup_ok) {
+        if (rank == 0) {
+            fputs("No se pudo preparar el texto cifrado.\n", stderr);
+        }
+        free(cipher);
+        MPI_Finalize();
+        return EXIT_FAILURE;
+    }
+
+    uint64_t lower = 0;
+    uint64_t upper = 0;
+    if (!compute_range(options.upper, process_count, rank, &lower, &upper)) {
+        free(cipher);
+        MPI_Finalize();
+        return EXIT_FAILURE;
+    }
+
+    const unsigned long long local_count =
+        (unsigned long long)(upper - lower);
+    unsigned long long max_count = 0;
+    MPI_Allreduce(&local_count, &max_count, 1, MPI_UNSIGNED_LONG_LONG,
+                  MPI_MAX, comm);
+
+    MPI_Barrier(comm);
+    const double start = MPI_Wtime();
+    unsigned long long global_candidate = ULLONG_MAX;
+    /* Busca las claves por lotes y sincroniza los resultados entre procesos. */
+    for (uint64_t offset = 0; offset < (uint64_t)max_count;
+         offset += SEARCH_BATCH_SIZE) {
+        uint64_t batch_lower = lower + offset;
+        uint64_t batch_upper = batch_lower;
+        if (batch_lower < upper) {
+            const uint64_t remaining = upper - batch_lower;
+            batch_upper = batch_lower +
+                (remaining < SEARCH_BATCH_SIZE ? remaining : SEARCH_BATCH_SIZE);
+        }
+
+        uint64_t local_found = UINT64_MAX;
+        unsigned long long local_candidate = ULLONG_MAX;
+        if (batch_lower < batch_upper &&
+            search_range(batch_lower, batch_upper, cipher, cipher_len,
+                         options.phrase, &local_found)) {
+            local_candidate = (unsigned long long)local_found;
+        }
+        MPI_Allreduce(&local_candidate, &global_candidate, 1,
+                      MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm);
+        if (global_candidate != ULLONG_MAX) {
+            break;
+        }
+    }
+
+    const double local_elapsed = MPI_Wtime() - start;
+    double elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+
+    int exit_code = EXIT_SUCCESS;
+    /* El proceso cero muestra el resultado y valida el texto recuperado. */
+    if (rank == 0) {
+        if (global_candidate == ULLONG_MAX) {
+            printf("Llave no encontrada en [0, %llu). Tiempo: %.6f s\n",
+                   (unsigned long long)options.upper, elapsed);
+            exit_code = 3;
+        } else {
+            size_t plain_len = 0;
+            const uint64_t found_key = (uint64_t)global_candidate;
+            if (!decrypt_buffer(found_key, cipher, cipher_len) ||
+                !remove_pkcs7_padding(cipher, cipher_len, &plain_len) ||
+                !plaintext_matches_expected(cipher, plain_len, options.text)) {
+                fputs("La llave se encontro, pero no se pudo descifrar.\n", stderr);
+                exit_code = EXIT_FAILURE;
+            } else {
+                printf("Llave encontrada: %llu\nTiempo: %.6f s\nTexto: %.*s\n",
+                       global_candidate, elapsed, (int)plain_len, (char *)cipher);
+            }
+        }
+    }
+
+    MPI_Bcast(&exit_code, 1, MPI_INT, 0, comm);
+    free(cipher);
+    MPI_Finalize();
+    return exit_code;
+}
+#endif
