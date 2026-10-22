@@ -3,6 +3,8 @@
  * DES y ECB son obsoletos e inseguros para sistemas reales; se conservan
  * exclusivamente porque forman parte de la consigna del curso.
  */
+/* Necesario para que unistd.h declare gethostname() con -std=c11. */
+#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -14,6 +16,7 @@
 
 #ifndef BRUTEFORCE_CORE_TEST
 #include <mpi.h>
+#include <unistd.h>
 /* DES es intencional por la consigna; OpenSSL 3 lo marca como obsoleto. */
 #define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/des.h>
@@ -27,8 +30,12 @@
 typedef struct {
     const char *text;
     const char *phrase;
+    const char *cipher_file;
     uint64_t key;
+    uint64_t lower;
     uint64_t upper;
+    bool has_key;
+    bool has_lower;
 } CliOptions;
 
 /* Calcula el rango de claves que corresponde a cada proceso MPI. */
@@ -204,7 +211,9 @@ static bool parse_uint56(const char *value, uint64_t *parsed) {
     return true;
 }
 
-/* Lee y valida las opciones recibidas desde la línea de comandos. */
+/* Lee y valida las opciones recibidas desde la línea de comandos.
+ * Admite dos modos: autoprueba (--text + --key, cifra y luego busca) o
+ * ataque real (--cipher-file, descifra un binario de origen desconocido). */
 bool parse_cli_options(int argc, char **argv, CliOptions *options,
                        char *error, size_t error_size) {
     if (options == NULL || argv == NULL) {
@@ -217,6 +226,8 @@ bool parse_cli_options(int argc, char **argv, CliOptions *options,
     bool have_phrase = false;
     bool have_key = false;
     bool have_upper = false;
+    bool have_cipher_file = false;
+    bool have_lower = false;
 
     for (int i = 1; i < argc; i += 2) {
         if (i + 1 >= argc) {
@@ -231,12 +242,23 @@ bool parse_cli_options(int argc, char **argv, CliOptions *options,
         } else if (strcmp(name, "--phrase") == 0 && !have_phrase) {
             parsed.phrase = value;
             have_phrase = true;
+        } else if (strcmp(name, "--cipher-file") == 0 && !have_cipher_file) {
+            parsed.cipher_file = value;
+            have_cipher_file = true;
         } else if (strcmp(name, "--key") == 0 && !have_key) {
             if (!parse_uint56(value, &parsed.key)) {
                 set_error(error, error_size, "--key debe ser un entero DES valido.");
                 return false;
             }
             have_key = true;
+            parsed.has_key = true;
+        } else if (strcmp(name, "--lower") == 0 && !have_lower) {
+            if (!parse_uint56(value, &parsed.lower)) {
+                set_error(error, error_size, "--lower debe ser un entero DES valido.");
+                return false;
+            }
+            have_lower = true;
+            parsed.has_lower = true;
         } else if (strcmp(name, "--upper") == 0 && !have_upper) {
             if (!parse_uint56(value, &parsed.upper)) {
                 set_error(error, error_size, "--upper debe ser un entero DES valido.");
@@ -249,26 +271,80 @@ bool parse_cli_options(int argc, char **argv, CliOptions *options,
         }
     }
 
-    if (!have_text || !have_phrase || !have_key || !have_upper) {
-        set_error(error, error_size, "Faltan opciones obligatorias.");
+    if (!have_phrase || !have_upper) {
+        set_error(error, error_size, "Faltan --phrase y/o --upper.");
         return false;
     }
-    const size_t text_len = strlen(parsed.text);
+    if (have_cipher_file == have_text) {
+        set_error(error, error_size,
+                  "Use --cipher-file (ataque real) o --text + --key (autoprueba), no ambos.");
+        return false;
+    }
+    if (have_text && !have_key) {
+        set_error(error, error_size, "--text requiere --key para la autoprueba.");
+        return false;
+    }
+
     const size_t phrase_len = strlen(parsed.phrase);
-    if (text_len == 0 || text_len > MAX_TEXT_BYTES) {
-        set_error(error, error_size, "El texto debe contener entre 1 byte y 1 MiB.");
+    if (have_text) {
+        const size_t text_len = strlen(parsed.text);
+        if (text_len == 0 || text_len > MAX_TEXT_BYTES) {
+            set_error(error, error_size, "El texto debe contener entre 1 byte y 1 MiB.");
+            return false;
+        }
+        if (phrase_len == 0 || phrase_len > text_len) {
+            set_error(error, error_size, "La frase no puede estar vacia ni superar el texto.");
+            return false;
+        }
+    } else if (phrase_len == 0) {
+        set_error(error, error_size, "La frase no puede estar vacia.");
         return false;
     }
-    if (phrase_len == 0 || phrase_len > text_len) {
-        set_error(error, error_size, "La frase no puede estar vacia ni superar el texto.");
+
+    if (parsed.upper == 0 || parsed.upper > DES_KEYSPACE_SIZE) {
+        set_error(error, error_size, "--upper debe cumplir 0 < upper <= 2^56.");
         return false;
     }
-    if (parsed.upper == 0 || parsed.upper > DES_KEYSPACE_SIZE ||
-        parsed.key >= parsed.upper) {
-        set_error(error, error_size, "Se requiere 0 <= key < upper <= 2^56.");
+    if (parsed.lower >= parsed.upper || (parsed.has_key && parsed.key >= parsed.upper)) {
+        set_error(error, error_size, "Se requiere lower (y key) < upper <= 2^56.");
         return false;
     }
     *options = parsed;
+    return true;
+}
+
+/* Lee un archivo binario completo (el texto cifrado de otro equipo). */
+bool read_cipher_file(const char *path, unsigned char **buffer, size_t *length) {
+    if (path == NULL || buffer == NULL || length == NULL) {
+        return false;
+    }
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return false;
+    }
+    const long size = ftell(f);
+    if (size < 0 || (size_t)size == 0 || (size_t)size > MAX_TEXT_BYTES ||
+        (size_t)size % DES_BLOCK_SIZE != 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+    unsigned char *data = malloc((size_t)size);
+    if (data == NULL) {
+        fclose(f);
+        return false;
+    }
+    const size_t read_bytes = fread(data, 1, (size_t)size, f);
+    fclose(f);
+    if (read_bytes != (size_t)size) {
+        free(data);
+        return false;
+    }
+    *buffer = data;
+    *length = (size_t)size;
     return true;
 }
 
@@ -319,9 +395,18 @@ bool search_range(uint64_t lower, uint64_t upper,
 /* Muestra la forma correcta de ejecutar el programa. */
 static void print_usage(const char *program) {
     fprintf(stderr,
-            "Uso: %s --text TEXTO --phrase FRASE --key N --upper N\n"
-            "Condicion: 0 <= key < upper <= 2^56.\n",
-            program);
+            "Autoprueba:   %s --text TEXTO --phrase FRASE --key N --upper N\n"
+            "Ataque real:  %s --cipher-file RUTA --phrase FRASE --upper N [--lower N]\n"
+            "Condicion: 0 <= lower < upper <= 2^56.\n",
+            program, program);
+}
+
+/* Obtiene el nombre del nodo actual para identificarlo en los logs. */
+static void get_node_name(char *buffer, size_t size) {
+    if (gethostname(buffer, size) != 0) {
+        snprintf(buffer, size, "desconocido");
+    }
+    buffer[size - 1] = '\0';
 }
 
 int main(int argc, char **argv) {
@@ -336,6 +421,9 @@ int main(int argc, char **argv) {
     int process_count = 0;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &process_count);
+
+    char node_name[256] = {0};
+    get_node_name(node_name, sizeof(node_name));
 
     CliOptions options;
     char error[160] = {0};
@@ -354,31 +442,44 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    /* Prepara el texto cifrado: lo cifra localmente (autoprueba) o lo lee
+     * de un archivo con el criptograma de otro equipo (ataque real). */
     unsigned char *cipher = NULL;
     size_t cipher_len = 0;
-    const int local_setup_ok =
-        pad_plaintext((const unsigned char *)options.text, strlen(options.text),
-                      &cipher, &cipher_len) &&
-        encrypt_buffer(options.key, cipher, cipher_len);
+    int local_setup_ok = 0;
+    if (options.cipher_file != NULL) {
+        local_setup_ok = read_cipher_file(options.cipher_file, &cipher, &cipher_len) ? 1 : 0;
+    } else {
+        local_setup_ok =
+            pad_plaintext((const unsigned char *)options.text, strlen(options.text),
+                          &cipher, &cipher_len) &&
+            encrypt_buffer(options.key, cipher, cipher_len);
+    }
     int all_setup_ok = 0;
     /* Confirma que todos los procesos prepararon el texto correctamente. */
     MPI_Allreduce(&local_setup_ok, &all_setup_ok, 1, MPI_INT, MPI_MIN, comm);
     if (!all_setup_ok) {
         if (rank == 0) {
-            fputs("No se pudo preparar el texto cifrado.\n", stderr);
+            fputs("No se pudo preparar el texto cifrado (revise --cipher-file).\n", stderr);
         }
         free(cipher);
         MPI_Finalize();
         return EXIT_FAILURE;
     }
 
-    uint64_t lower = 0;
-    uint64_t upper = 0;
-    if (!compute_range(options.upper, process_count, rank, &lower, &upper)) {
+    uint64_t span_lower = 0;
+    uint64_t span_upper = 0;
+    if (!compute_range(options.upper - options.lower, process_count, rank,
+                       &span_lower, &span_upper)) {
         free(cipher);
         MPI_Finalize();
         return EXIT_FAILURE;
     }
+    const uint64_t lower = options.lower + span_lower;
+    const uint64_t upper = options.lower + span_upper;
+    printf("Nodo %s, proceso %d de %d: rango [%llu, %llu)\n", node_name, rank,
+           process_count, (unsigned long long)lower, (unsigned long long)upper);
+    fflush(stdout);
 
     const unsigned long long local_count =
         (unsigned long long)(upper - lower);
@@ -406,6 +507,9 @@ int main(int argc, char **argv) {
             search_range(batch_lower, batch_upper, cipher, cipher_len,
                          options.phrase, &local_found)) {
             local_candidate = (unsigned long long)local_found;
+            printf("Nodo %s, proceso %d: encontro una candidata en %llu\n",
+                   node_name, rank, local_candidate);
+            fflush(stdout);
         }
         MPI_Allreduce(&local_candidate, &global_candidate, 1,
                       MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm);
@@ -422,15 +526,26 @@ int main(int argc, char **argv) {
     /* El proceso cero muestra el resultado y valida el texto recuperado. */
     if (rank == 0) {
         if (global_candidate == ULLONG_MAX) {
-            printf("Llave no encontrada en [0, %llu). Tiempo: %.6f s\n",
+            printf("Llave no encontrada en [%llu, %llu). Tiempo: %.6f s\n",
+                   (unsigned long long)options.lower,
                    (unsigned long long)options.upper, elapsed);
             exit_code = 3;
         } else {
             size_t plain_len = 0;
             const uint64_t found_key = (uint64_t)global_candidate;
-            if (!decrypt_buffer(found_key, cipher, cipher_len) ||
-                !remove_pkcs7_padding(cipher, cipher_len, &plain_len) ||
-                !plaintext_matches_expected(cipher, plain_len, options.text)) {
+            const bool decrypted = decrypt_buffer(found_key, cipher, cipher_len) &&
+                                   remove_pkcs7_padding(cipher, cipher_len, &plain_len);
+            if (options.cipher_file != NULL) {
+                /* No hay texto esperado: se confia en el relleno PKCS#7 valido. */
+                if (!decrypted) {
+                    fputs("La llave se encontro, pero no se pudo descifrar.\n", stderr);
+                    exit_code = EXIT_FAILURE;
+                } else {
+                    printf("Llave encontrada: %llu\nTiempo: %.6f s\nTexto: %.*s\n",
+                           global_candidate, elapsed, (int)plain_len, (char *)cipher);
+                }
+            } else if (!decrypted ||
+                      !plaintext_matches_expected(cipher, plain_len, options.text)) {
                 fputs("La llave se encontro, pero no se pudo descifrar.\n", stderr);
                 exit_code = EXIT_FAILURE;
             } else {

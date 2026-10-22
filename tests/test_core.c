@@ -89,6 +89,38 @@ static void test_cli_validation(void) {
     assert(!parse_cli_options(9, bad_number, &options, error, sizeof(error)));
     assert(!parse_cli_options(9, key_outside, &options, error, sizeof(error)));
     assert(!parse_cli_options(9, too_large, &options, error, sizeof(error)));
+
+    char *cipher_mode[] = {
+        "bruteforce_mpi", "--cipher-file", "datos/otro.bin", "--phrase", "clave",
+        "--upper", "32"
+    };
+    char *cipher_and_text[] = {
+        "bruteforce_mpi", "--cipher-file", "datos/otro.bin", "--text", "mensaje",
+        "--phrase", "clave", "--key", "1", "--upper", "32"
+    };
+    char *neither_mode[] = {
+        "bruteforce_mpi", "--phrase", "clave", "--upper", "32"
+    };
+    char *with_lower[] = {
+        "bruteforce_mpi", "--cipher-file", "datos/otro.bin", "--phrase", "clave",
+        "--lower", "8", "--upper", "32"
+    };
+
+    assert(parse_cli_options(7, cipher_mode, &options, error, sizeof(error)));
+    assert(!options.has_key && options.lower == 0 && options.upper == 32);
+    assert(!parse_cli_options(10, cipher_and_text, &options, error, sizeof(error)));
+    assert(!parse_cli_options(5, neither_mode, &options, error, sizeof(error)));
+    assert(parse_cli_options(9, with_lower, &options, error, sizeof(error)));
+    assert(options.lower == 8 && options.upper == 32);
+}
+
+/* Verifica que un archivo de cifrado inexistente se rechace sin fallar. */
+static void test_read_cipher_file_rejects_missing_file(void) {
+    unsigned char *buffer = NULL;
+    size_t length = 0;
+
+    assert(!read_cipher_file("ruta/que/no/existe.bin", &buffer, &length));
+    assert(!read_cipher_file(NULL, &buffer, &length));
 }
 
 /* Comprueba que la búsqueda encuentre una clave en un rango pequeño. */
@@ -126,8 +158,9 @@ int main(void) {
     test_pkcs7_padding_round_trip();
     test_rejects_invalid_padding();
     test_cli_validation();
+    test_read_cipher_file_rejects_missing_file();
     test_search_finds_key_in_small_space();
     test_plaintext_verification_requires_exact_match();
-    puts("OK: 6 pruebas del nucleo superadas");
+    puts("OK: 7 pruebas del nucleo superadas");
     return 0;
 }
