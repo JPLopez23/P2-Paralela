@@ -1,0 +1,3 @@
+build/
+*.o
+cluster_hosts

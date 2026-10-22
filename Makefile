@@ -4,9 +4,10 @@ CPPFLAGS ?=
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
 CRYPTO_CFLAGS ?=
 CRYPTO_LIBS ?= -lcrypto
+DOCKER_IMAGE ?= mpi-cluster-image
 
 # Declara los objetivos principales del proyecto.
-.PHONY: all test clean
+.PHONY: all test clean docker-build docker-shell
 
 # Compila el programa MPI.
 all: build/bruteforce_mpi
@@ -30,3 +31,11 @@ test: build/test_core
 # Elimina los archivos generados.
 clean:
 	rm -rf build
+
+# Construye la imagen de Docker usada en el cluster (Parte 2).
+docker-build:
+	docker build -t $(DOCKER_IMAGE) .
+
+# Abre una terminal interactiva dentro de un contenedor de prueba.
+docker-shell:
+	docker run -it --rm --network host --name mpi_node $(DOCKER_IMAGE) /bin/bash
