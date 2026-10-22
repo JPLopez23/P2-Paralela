@@ -20,12 +20,25 @@
 /* DES es intencional por la consigna; OpenSSL 3 lo marca como obsoleto. */
 #define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/des.h>
+#include <openssl/sha.h>
+#include <openssl/md5.h>
 #endif
 
 #define DES_BLOCK_SIZE 8U
 #define DES_KEYSPACE_SIZE (UINT64_C(1) << 56)
 #define MAX_TEXT_BYTES (1024U * 1024U)
 #define SEARCH_BATCH_SIZE UINT64_C(4096)
+
+/* Variantes de interoperabilidad: 0=7-bit BE, 1=7-bit LE,
+ * 2=entero de 64 bits LE, 3=entero de 64 bits BE, 4=mascaras int32 heredadas,
+ * 5=decimal con ceros, 6=decimal con NUL, 7=hexadecimal con ceros,
+ * 8/9=grupos de 7 bits BE/LE sin desplazamiento, 10=SHA256(decimal),
+ * 11=MD5(decimal), 12=DES_string_to_key(decimal),
+ * 13/14=decimal con espacios a derecha/izquierda.
+ * Se seleccionan al compilar, sin alterar el formato predeterminado. */
+#ifndef DES_KEY_LAYOUT
+#define DES_KEY_LAYOUT 0
+#endif
 
 typedef struct {
     const char *text;
@@ -134,10 +147,66 @@ bool plaintext_matches_expected(const unsigned char *recovered,
 
 static void logical_key_to_des(uint64_t key, unsigned char des_key[8]) {
     /* Convierte la clave lógica al formato de ocho bytes usado por DES. */
+#if DES_KEY_LAYOUT >= 10 && DES_KEY_LAYOUT <= 14
+    char encoded[32] = {0};
+    snprintf(encoded, sizeof(encoded), "%llu", (unsigned long long)key);
+#if DES_KEY_LAYOUT == 10
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256((const unsigned char *)encoded, strlen(encoded), digest);
+    memcpy(des_key, digest, 8);
+#elif DES_KEY_LAYOUT == 11
+    unsigned char digest[MD5_DIGEST_LENGTH];
+    MD5((const unsigned char *)encoded, strlen(encoded), digest);
+    memcpy(des_key, digest, 8);
+#elif DES_KEY_LAYOUT == 12
+    DES_string_to_key(encoded, (DES_cblock *)des_key);
+#elif DES_KEY_LAYOUT == 13
+    memset(des_key, ' ', 8);
+    memcpy(des_key, encoded, strlen(encoded) < 8 ? strlen(encoded) : 8);
+#else
+    snprintf(encoded, sizeof(encoded), "%8llu", (unsigned long long)key);
+    memcpy(des_key, encoded, 8);
+#endif
+#elif DES_KEY_LAYOUT == 4
+    /* Emula las mascaras int32 del ejemplo original sin desplazamientos UB. */
+    uint64_t packed = 0;
+    for (unsigned int i = 0; i < 8; ++i) {
+        key <<= 1;
+        const uint32_t mask = UINT32_C(0xfe) << ((i * 8U) % 32U);
+        const uint64_t extended = (uint64_t)(int64_t)(int32_t)mask;
+        packed += key & extended;
+    }
+    for (size_t i = 0; i < 8; ++i) des_key[i] = (unsigned char)(packed >> (i * 8U));
+#elif DES_KEY_LAYOUT >= 5 && DES_KEY_LAYOUT <= 7
+    char encoded[32] = {0};
+#if DES_KEY_LAYOUT == 5
+    snprintf(encoded, sizeof(encoded), "%08llu", (unsigned long long)key);
+#elif DES_KEY_LAYOUT == 6
+    snprintf(encoded, sizeof(encoded), "%llu", (unsigned long long)key);
+#else
+    snprintf(encoded, sizeof(encoded), "%08llx", (unsigned long long)key);
+#endif
+    memcpy(des_key, encoded, 8);
+#else
     for (size_t byte = 0; byte < 8; ++byte) {
+#if DES_KEY_LAYOUT == 1
+        des_key[byte] = (unsigned char)(((key >> (byte * 7U)) & UINT64_C(0x7f)) << 1);
+#elif DES_KEY_LAYOUT == 2
+        des_key[byte] = (unsigned char)(key >> (byte * 8U));
+#elif DES_KEY_LAYOUT == 3
+        des_key[byte] = (unsigned char)(key >> ((7U - byte) * 8U));
+#elif DES_KEY_LAYOUT == 8
+        des_key[byte] = (unsigned char)((key >> ((7U - byte) * 7U)) & 0x7f);
+#elif DES_KEY_LAYOUT == 9
+        des_key[byte] = (unsigned char)((key >> (byte * 7U)) & 0x7f);
+#elif DES_KEY_LAYOUT == 0
         const unsigned int shift = (unsigned int)((7U - byte) * 7U);
         des_key[byte] = (unsigned char)(((key >> shift) & UINT64_C(0x7f)) << 1);
+#else
+#error "DES_KEY_LAYOUT invalido"
+#endif
     }
+#endif
 }
 
 static bool crypt_buffer(uint64_t key, unsigned char *buffer, size_t len,
@@ -149,6 +218,10 @@ static bool crypt_buffer(uint64_t key, unsigned char *buffer, size_t len,
 
     unsigned char des_key[8];
     logical_key_to_des(key, des_key);
+#ifdef DES_RPC_PARITY
+    /* des_setparity de SunRPC descarta el bit alto antes de ajustar paridad. */
+    for (size_t i = 0; i < 8; ++i) des_key[i] &= 0x7f;
+#endif
 
 #ifdef BRUTEFORCE_CORE_TEST
     /* Usa una transformación determinista para probar el núcleo sin MPI ni DES. */
@@ -168,6 +241,11 @@ static bool crypt_buffer(uint64_t key, unsigned char *buffer, size_t len,
     memcpy(key_block, des_key, sizeof(key_block));
     DES_set_odd_parity(&key_block);
     DES_set_key_unchecked(&key_block, &schedule);
+#ifdef DES_DIAGNOSTIC_CBC
+    DES_cblock iv = {0};
+    DES_ncbc_encrypt(buffer, buffer, (long)len, &schedule, &iv,
+                     decrypting ? DES_DECRYPT : DES_ENCRYPT);
+#else
     for (size_t offset = 0; offset < len; offset += DES_BLOCK_SIZE) {
         DES_cblock input_block;
         DES_cblock output_block;
@@ -176,6 +254,7 @@ static bool crypt_buffer(uint64_t key, unsigned char *buffer, size_t len,
                         decrypting ? DES_DECRYPT : DES_ENCRYPT);
         memcpy(buffer + offset, output_block, sizeof(output_block));
     }
+#endif
     return true;
 #endif
 }
@@ -348,6 +427,21 @@ bool read_cipher_file(const char *path, unsigned char **buffer, size_t *length) 
     return true;
 }
 
+/* Busca una frase en un búfer que puede contener bytes nulos. */
+static bool contains_bytes(const unsigned char *buffer, size_t buffer_len,
+                          const char *needle) {
+    const size_t needle_len = strlen(needle);
+    if (needle_len == 0 || needle_len > buffer_len) {
+        return false;
+    }
+    for (size_t offset = 0; offset <= buffer_len - needle_len; ++offset) {
+        if (memcmp(buffer + offset, needle, needle_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Descifra una candidata y busca la frase indicada. */
 bool try_key(uint64_t key, const unsigned char *cipher, size_t cipher_len,
              const char *phrase) {
@@ -363,13 +457,12 @@ bool try_key(uint64_t key, const unsigned char *cipher, size_t cipher_len,
     }
     memcpy(candidate, cipher, cipher_len);
 
-    size_t plain_len = 0;
-    const bool valid = decrypt_buffer(key, candidate, cipher_len) &&
-                       remove_pkcs7_padding(candidate, cipher_len, &plain_len);
+    size_t plain_len = cipher_len;
     bool matches = false;
-    if (valid) {
-        candidate[plain_len] = '\0';
-        matches = strstr((const char *)candidate, phrase) != NULL;
+    if (decrypt_buffer(key, candidate, cipher_len)) {
+        /* Los archivos del foro pueden usar PKCS#7, NUL o espacio de relleno. */
+        (void)remove_pkcs7_padding(candidate, cipher_len, &plain_len);
+        matches = contains_bytes(candidate, plain_len, phrase);
     }
     free(candidate);
     return matches;
@@ -533,18 +626,25 @@ int main(int argc, char **argv) {
         } else {
             size_t plain_len = 0;
             const uint64_t found_key = (uint64_t)global_candidate;
-            const bool decrypted = decrypt_buffer(found_key, cipher, cipher_len) &&
+            const bool decrypted_ok = decrypt_buffer(found_key, cipher, cipher_len);
+            const bool has_pkcs7 = decrypted_ok &&
                                    remove_pkcs7_padding(cipher, cipher_len, &plain_len);
             if (options.cipher_file != NULL) {
-                /* No hay texto esperado: se confia en el relleno PKCS#7 valido. */
-                if (!decrypted) {
+                /* Acepta formatos de relleno alternativos usados por otros equipos. */
+                if (!decrypted_ok) {
                     fputs("La llave se encontro, pero no se pudo descifrar.\n", stderr);
                     exit_code = EXIT_FAILURE;
                 } else {
+                    if (!has_pkcs7) {
+                        plain_len = cipher_len;
+                        while (plain_len > 0 && cipher[plain_len - 1] == '\0') {
+                            --plain_len;
+                        }
+                    }
                     printf("Llave encontrada: %llu\nTiempo: %.6f s\nTexto: %.*s\n",
                            global_candidate, elapsed, (int)plain_len, (char *)cipher);
                 }
-            } else if (!decrypted ||
+            } else if (!decrypted_ok || !has_pkcs7 ||
                       !plaintext_matches_expected(cipher, plain_len, options.text)) {
                 fputs("La llave se encontro, pero no se pudo descifrar.\n", stderr);
                 exit_code = EXIT_FAILURE;

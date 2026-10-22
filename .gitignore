@@ -1,3 +1,6 @@
 build/
 *.o
 cluster_hosts
+/datos/grupo7_texto_candidato.txt
+/resultados/grupo7_descifrado.txt
+/resultados/grupo9_descifrado.txt

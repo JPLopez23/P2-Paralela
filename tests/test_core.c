@@ -140,6 +140,24 @@ static void test_search_finds_key_in_small_space(void) {
     free(cipher);
 }
 
+/* Admite cifrados del foro con relleno NUL o espacios en lugar de PKCS#7. */
+static void test_search_accepts_alternative_padding(void) {
+    unsigned char plaintext[32] = {0};
+    const char *phrase = "tolerancia a fallos";
+    const uint64_t expected_key = 37;
+    const size_t cipher_len = sizeof(plaintext);
+    unsigned char *cipher = malloc(cipher_len);
+    uint64_t found = UINT64_MAX;
+
+    assert(cipher != NULL);
+    memcpy(plaintext, phrase, strlen(phrase));
+    memcpy(cipher, plaintext, cipher_len);
+    assert(encrypt_buffer(expected_key, cipher, cipher_len));
+    assert(search_range(0, 64, cipher, cipher_len, phrase, &found));
+    assert(found == expected_key);
+    free(cipher);
+}
+
 /* Confirma que la comparación del texto sea exacta. */
 static void test_plaintext_verification_requires_exact_match(void) {
     const unsigned char recovered[] = "mensaje completo";
@@ -160,7 +178,8 @@ int main(void) {
     test_cli_validation();
     test_read_cipher_file_rejects_missing_file();
     test_search_finds_key_in_small_space();
+    test_search_accepts_alternative_padding();
     test_plaintext_verification_requires_exact_match();
-    puts("OK: 7 pruebas del nucleo superadas");
+    puts("OK: 8 pruebas del nucleo superadas");
     return 0;
 }

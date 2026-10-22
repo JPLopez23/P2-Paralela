@@ -1,4 +1,125 @@
-# Bitácora del proyecto
+# Bitácora: búsqueda del reto del Grupo 7
+
+## Grupo 9 — 2026-10-21 — llave verificada
+
+- Entrada: base64 proporcionado por el usuario, conservado en
+  `datos/grupo9_cifrado.b64` y decodificado en `datos/grupo9_cifrado.des`.
+  Longitud: 2168 bytes. SHA-256 local y remoto:
+  `0f9eedc5f395e714b83e7571b3d50d13290a99f8ca9d3f205ee5fa557dbf4f18`.
+- Frase exacta: `computación paralela y distribuida`.
+- Rango autorizado: desde 0 hasta 2^24 inclusive (`[0,16777217)`).
+- **Llave lógica: 3141592. Llave DES con paridad: b0bf7f0201010101.**
+  Modo DES-ECB y conversión `DES_KEY_LAYOUT=1` (grupos de siete bits LE).
+- El worker `172.20.10.14`, rank 0 de cinco procesos MPI, encontró la
+  candidata. Tiempo reportado por el diagnóstico layout 1: 3.610660 s;
+  no representa la duración total de todos los intentos ni un benchmark
+  del buscador original. Layout 0 no produjo candidatas heurísticas.
+- Se verificó de forma independiente con la CLI OpenSSL local: texto
+  coherente completo que contiene la frase exacta. Los últimos seis bytes
+  son espacios, no relleno PKCS#7; se conservaron intactos con `-nopad`.
+- Al recifrar con OpenSSL, `cmp` confirmó igualdad byte a byte con el
+  ciphertext recibido y el SHA-256 anterior coincidió.
+- El buscador MPI principal, compilado con `DES_KEY_LAYOUT=1`, confirmó
+  la frase exacta en `[3141592,3141593)`. Esta comprobación de una sola llave
+  no es una nueva búsqueda ni una medición de fuerza bruta.
+- La tanda diagnóstica terminó: conversiones ECB 0 a 14 completadas,
+  únicamente layout 1 produjo una candidata. No quedan trabajos de esta
+  tanda activos. `make test`: ocho pruebas superadas; `git diff --check`: limpio.
+- Archivos recuperados: `resultados/grupo9_descifrado.txt` y
+  `resultados/grupo9_recifrado.des`. No se modificaron los resultados del
+  Grupo 7. El diagnóstico ahora usa nombres temporales genéricos
+  `/tmp/des-candidata-layoutN-keyK.txt` para no etiquetar otros retos como Grupo 7.
+
+Comando reproducible (OpenSSL 3):
+
+```sh
+openssl enc -des-ecb -d -nopad -provider legacy -provider default \
+  -K b0bf7f0201010101 -in datos/grupo9_cifrado.des \
+  -out resultados/grupo9_descifrado.txt
+```
+
+## Resultado confirmado — rango corregido a 2^24
+
+- El usuario corrigió el límite: **2^24**, no 2^22. Se buscó desde cero
+  con límite exclusivo 16777217 para incluir también el extremo.
+- **Llave lógica encontrada: 12989899.** DES-ECB, conversión `DES_KEY_LAYOUT=1`
+  (grupos de siete bits en orden little-endian), llave hexadecimal con
+  paridad ajustada: **97d6310d01010101**.
+- Encontrada por el rank 3 del worker `172.20.10.14`, con cinco procesos.
+  El diagnóstico de esa conversión reportó 1.410655 s; no es el tiempo total
+  de todos los intentos ni una medición comparable al buscador original.
+- Se utilizó como referencia el texto suministrado por el usuario, guardado
+  en `datos/grupo7_texto_candidato.txt` (2145 bytes UTF-8 con salto final).
+  La comparación exacta de 24 bytes reemplazó el filtro heurístico.
+- Se corrigió un error inicial del diagnóstico: el lector del ciphertext
+  rechazaba texto conocido de longitud no múltiplo de ocho. Esas ejecuciones
+  abortadas no cuentan como búsquedas completadas.
+- Validación independiente mediante la CLI OpenSSL local (la CLI no estaba
+  instalada en el worker): descifrado PKCS#7 correcto, siete bytes de relleno;
+  `cmp` confirmó igualdad exacta con todo el texto suministrado. Al recifrar,
+  `cmp` confirmó igualdad byte a byte con el archivo original y SHA-256
+  `285de3acef0f7d8371666b74f66edc3026b5721566f8c8a69fcc9acb7b41e596`.
+- Artefactos: `resultados/grupo7_descifrado.txt` y
+  `resultados/grupo7_recifrado.des`. **Reto criptográfico resuelto.**
+- La llave encontrada supera 2^22: el límite anterior la excluía.
+
+Verificación reproducible con OpenSSL 3:
+
+```sh
+openssl enc -des-ecb -d -provider legacy -provider default \
+  -K 97d6310d01010101 -in /Users/joseruiz/Downloads/cifrado_foro-1.des \
+  -out resultados/grupo7_descifrado.txt
+cmp resultados/grupo7_descifrado.txt datos/grupo7_texto_candidato.txt
+```
+
+## 2026-10-21
+
+- Objetivo: recuperar la llave del archivo `cifrado_foro-1.des`, buscando
+  `tolerancia a fallos`. El usuario confirmó que el rango empieza en **0**.
+- Archivo de 2152 bytes. SHA-256 verificado en original, maestro y worker:
+  `285de3acef0f7d8371666b74f66edc3026b5721566f8c8a69fcc9acb7b41e596`.
+- Se recorrió el rango `[0, 4194305)`: incluye también el extremo `2^22`
+  para evitar una discrepancia de límite inclusivo/exclusivo.
+- Se realizaron búsquedas completas de la frase con varias conversiones de
+  llave DES, sin coincidencia. Se permitió buscar la frase aunque el relleno
+  no fuera PKCS#7, para admitir archivos con relleno cero.
+- El worker `172.20.10.14` ejecutó cálculos reales con cinco procesos MPI,
+  usando `--use-hwthread-cpus`. Las ejecuciones remotas se lanzaron por SSH.
+  Esto no equivale a un único trabajo MPI entre ambas máquinas: la conectividad
+  MPI entre las redes virtuales de los contenedores sigue sin resolverse.
+- Se añadió `scripts/diagnosticar_des.c`, diagnóstico experimental que prueba
+  texto plausible sin exigir la frase exacta, incluyendo ceros compatibles
+  con UTF-16. Examina muestras iniciales/intermedias antes del texto completo.
+  Es un filtro heurístico: puede descartar texto válido, comprimido o binario;
+  un resultado negativo no demuestra que la llave esté fuera del rango.
+- Se incorporaron variantes de conversión seleccionables mediante
+  `DES_KEY_LAYOUT`, además de CBC con IV cero y paridad heredada opcionales.
+  El comportamiento predeterminado sigue siendo DES-ECB, conversión 0.
+- Se validó el diagnóstico con un cifrado sintético de llave 37 y texto
+  conocido: recuperó correctamente la llave y el texto. `make test` pasó
+  las ocho pruebas del núcleo; estas usan una transformación simulada, no
+  sustituyen la validación criptográfica anterior. `git diff --check` pasó.
+- Una tanda remota se interrumpió al cambiar el contenedor del worker
+  (`1c46721f24ee` a `c52b4de8a644`). Se comprobó SSH, se repusieron fuentes y
+  ciphertext y se reinició el diagnóstico con cinco procesos desde cero.
+- La tanda reiniciada terminó con código de salida 0: las 15 conversiones
+  (0 a 14), tanto en ECB como en CBC con IV cero, recorrieron el rango
+  completo y reportaron cero candidatas según el filtro heurístico.
+  **Estado: llave todavía no recuperada; no quedan búsquedas de esta tanda
+  ejecutándose.**
+
+## Información necesaria para confirmar interoperabilidad
+
+Solicitar al Grupo 7 su código de cifrado o la descripción exacta del modo,
+conversión del entero a los ocho bytes DES, IV (si aplica), relleno y formato
+del archivo. No se necesita que revelen la llave. Hasta recuperar y validar
+el texto no debe registrarse el reto como resuelto.
+
+---
+
+## Registro anterior del proyecto (conservado del commit remoto)
+
+Los apartados marcados como pendientes describen el estado anterior a las llaves verificadas arriba.
 
 CC3069 - Computación Paralela y Distribuida. Repo: https://github.com/JPLopez23/P2-Paralela
 
