@@ -1,0 +1,12 @@
+# Hostfile de ejemplo para el cluster fisico (Parte 2, seccion V y VI).
+# Copien este archivo a "cluster_hosts" y reemplacen las IPs por las que
+# el router les asigne a cada contenedor (deben usar --network host).
+#
+# slots = procesos MPI que ese nodo puede correr en paralelo.
+# max_slots / max-slots = tope fisico para evitar oversubscription agresiva
+# (clave en un algoritmo con tanto cambio de contexto como DES por fuerza bruta).
+#
+# El nodo maestro tambien puede listarse aqui si va a correr procesos.
+192.168.1.10 slots=4 max_slots=4
+192.168.1.11 slots=4 max_slots=4
+192.168.1.12 slots=4 max_slots=4
