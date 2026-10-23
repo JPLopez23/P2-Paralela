@@ -115,6 +115,135 @@ conversión del entero a los ocho bytes DES, IV (si aplica), relleno y formato
 del archivo. No se necesita que revelen la llave. Hasta recuperar y validar
 el texto no debe registrarse el reto como resuelto.
 
+## Despliegue físico del clúster — diagnóstico de red (21-oct)
+
+Equipo conectado al hotspot de un iPhone (red `172.20.10.0/28`): Mac del compañero como **maestro** (`172.20.10.10`, usando OrbStack), esta PC Windows como **worker** (`172.20.10.14`, Docker Desktop).
+
+### Problema 1: `--network host` en Docker Desktop para Windows no expone la red real
+
+Al correr `scripts/docker/start_node.sh` dentro de un contenedor con `--network host`, las IPs que mostraba el contenedor eran `192.168.65.x` y rangos `172.17-21.x` (redes internas de Docker), **nunca** la IP real de Windows en el hotspot (`172.20.10.14`). Diagnóstico paso a paso:
+
+1. Se confirmó con `ipconfig` que la IP real del adaptador Wi-Fi de Windows sí era `172.20.10.14`.
+2. `Test-NetConnection` **desde la misma Windows** hacia `172.20.10.14:22` funcionaba — pero esto fue engañoso: Windows redirige automáticamente conexiones locales dirigidas a su propia IP externa hacia dentro de WSL2 (un comportamiento conocido de "localhost forwarding"), así que ese resultado no demuestra alcance real desde otra máquina.
+3. El `ping` entre ambas máquinas sí funcionaba en ambos sentidos (descartando aislamiento de clientes del hotspot).
+4. Se revisó `.wslconfig` (`C:\Users\jplop\.wslconfig`) y **no tenía** `networkingMode=mirrored` — se agregó, y se confirmó con `wsl -d docker-desktop -- ip addr` que la VM de Docker Desktop sí pasó a tener la IP real `172.20.10.14` directamente.
+5. Aun así, **el contenedor** (incluso con `--network host`) seguía sin ver esa interfaz — solo veía las redes internas de Docker (`192.168.65.3/24`, puentes `172.17-21.0.1`). Conclusión: en Docker Desktop para Windows, `--network host` comparte la red interna de la VM de Docker, **no** la interfaz real de Windows, sin importar si WSL está en modo mirrored. Es una limitación propia de Windows, distinta a Linux/Mac (donde sí funciona como describe el PDF).
+
+**Solución aplicada:** dejar de usar `--network host` en Windows y en su lugar publicar el puerto explícitamente:
+```powershell
+docker run -dit -p 22:22 --name mpi_node mpi-cluster-image /bin/bash
+```
+Docker Desktop sí reenvía correctamente el tráfico que llega a la IP real de Windows en el puerto publicado, independientemente del problema de `--network host`.
+
+### Problema 2: firewall de Windows bloqueando el puerto 22 entrante
+
+El adaptador Wi-Fi estaba en perfil **Público** (el más restrictivo), sin ninguna regla que permitiera el puerto 22 de entrada. Se agregó una regla mínima (solo TCP 22, solo desde la subred del hotspot, no se desactivó el firewall completo):
+```powershell
+New-NetFirewallRule -DisplayName "MPI-Cluster SSH 22 (LAN)" -Direction Inbound -Protocol TCP -LocalPort 22 -RemoteAddress 172.20.10.0/24 -Profile Any -Action Allow
+```
+
+### Problema 3: intercambio de llaves SSH
+
+Con la red y el firewall resueltos, el maestro ya lograba conectar por TCP pero rechazaba la autenticación (esperado: todavía no se había copiado la llave pública del maestro al worker). Se agregó manualmente la llave pública del maestro (`root@orbstack`) a `/root/.ssh/authorized_keys` del contenedor worker, con permisos `700`/`600`.
+
+### Problema 4: puertos dinámicos de MPI (BTL/OOB) en el worker de Windows
+
+`--network host` no estaba disponible para el worker Windows (ver Problema 1), así que OpenMPI tampoco puede usar puertos aleatorios ahí: Docker solo reenvía los puertos que se publicaron explícitamente al crear el contenedor.
+
+**Solución:** se fijó un rango de 20 puertos TCP para este worker y se publicaron todos:
+```powershell
+docker run -dit -p 22:22 -p 50000-50019:50000-50019 --name mpi_node mpi-cluster-image /bin/bash
+```
+Y una regla de firewall equivalente para ese rango.
+
+`scripts/docker/run_cluster.sh` ahora acepta `FIXED_PORTS=1` para que el `mpirun` del maestro use ese mismo rango fijo (`--mca btl_tcp_port_min_v4 50000 --mca btl_tcp_port_range_v4 10 --mca oob_tcp_port_min_v4 50010 --mca oob_tcp_port_range_v4 10`) en vez de puertos aleatorios no publicados:
+```bash
+FIXED_PORTS=1 bash scripts/docker/run_cluster.sh 172.20.10.0/24 cluster_hosts <TOTAL_SLOTS> \
+  --cipher-file datos/cifrado_grupo7.des --phrase "tolerancia a fallos" --upper 16777216
+```
+
+Nota: si hay más de un worker Windows en el clúster, cada uno necesita su propio rango de puertos publicado sin solaparse (ej. el segundo worker Windows usaría `50020-50039`), porque Docker no puede publicar el mismo puerto dos veces en la misma máquina.
+
+### Estado al 21-oct: maestro y primer worker conectados por SSH sin contraseña
+
+Falta integrar al tercer integrante del equipo y correr el Paso B (ataque distribuido real) con los tres nodos.
+
+**Nota (22-oct):** el equipo ya no está todos en la misma red física. Se decidió usar una VPN mesh (Tailscale) para reconectar virtualmente a los 3 sin depender de estar en el mismo router/hotspot — mismo procedimiento de arriba, solo cambian las IPs (de `172.20.10.x` a las `100.x.x.x` que asigna Tailscale) y las reglas de firewall/`--mca ..._if_include` deben apuntar a `100.64.0.0/10` en vez de `172.20.10.0/24`.
+
+### ✅ 23-oct — Paso B logrado: ataque distribuido real con los 3 nodos
+
+Problema adicional con Tailscale: los contenedores sin `--network host`
+(los Windows) no tenían ninguna interfaz propia dentro de `100.64.0.0/10`,
+así que `--mca btl_tcp_if_include`/`oob_tcp_if_include` no encontraban
+nada que usar. Solución: dentro de cada contenedor Windows,
+
+```bash
+docker commit mpi_node mpi-cluster-worker-ready
+docker run -dit --cap-add NET_ADMIN --sysctl net.ipv4.ip_nonlocal_bind=1 \
+  -p 22:22 -p 50000-50019:50000-50019 --name mpi_node mpi-cluster-worker-ready bash
+docker exec mpi_node bash -lc "ip link add tsmpi type dummy && \
+  ip addr add <ip_tailscale>/10 dev tsmpi noprefixroute && ip link set tsmpi up && \
+  bash scripts/docker/start_node.sh"
+```
+
+Esto crea una interfaz de red virtual (`tsmpi`, tipo `dummy`) dentro del
+contenedor con la IP de Tailscale de esa máquina asignada, más
+`net.ipv4.ip_nonlocal_bind=1` para permitir enlazarse a esa dirección
+aunque el kernel no la reconozca como "local" por defecto. Con eso,
+OpenMPI ya encontraba una interfaz válida dentro del rango de Tailscale.
+
+**Cambio de rol:** el nodo maestro originalmente planeado (este worker,
+`JPLopez23`) no logró completar su propia conexión a Tailscale a tiempo
+(problema de cuenta: quedó en su tailnet personal por accidente en vez de
+la del equipo — se resolvió con `tailscale logout` y volver a entrar
+desde el correo de invitación, pero ya tarde). **Fer tomó el rol de
+maestro.** Este equipo terminó como worker.
+
+**Comando final, ejecutado por Fer (maestro) el 23-oct:**
+
+```
+Get-Content cluster_hosts
+100.93.43.1 slots=1 max_slots=1
+100.110.1.47 slots=1 max_slots=1
+100.119.140.37 slots=1 max_slots=1
+
+mpirun --allow-run-as-root --hostfile cluster_hosts --map-by ppr:1:node \
+  --mca oob_tcp_if_include tsmpi --mca oob_tcp_static_ipv4_ports 50009 \
+  --mca btl self,tcp --mca btl_tcp_if_include tsmpi \
+  --mca btl_tcp_port_min_v4 50010 --mca btl_tcp_port_range_v4 1 \
+  -np 3 ./build/bruteforce_mpi \
+  --cipher-file datos/cifrado_grupo7.des --phrase 'tolerancia a fallos' --upper 16777216
+
+Nodo 0d9ce0b91b4e, proceso 0 de 3: rango [0, 5592406)
+Nodo 39e08d63be0e, proceso 1 de 3: rango [5592406, 11184811)
+Nodo 72035ee6bfda, proceso 2 de 3: rango [11184811, 16777216)
+Nodo 72035ee6bfda, proceso 2: encontro una candidata en 12989899
+Llave encontrada: 12989899
+Tiempo: 66.56248 s
+Texto: Un clúster de computadoras es un conjunto de máquinas independientes...
+Exit code: 0
+```
+
+**3 nodos distintos participaron de verdad** (`0d9ce0b91b4e` = maestro,
+`39e08d63be0e` = Oli, `72035ee6bfda` = este worker, que fue el que
+encontró la candidata). Comparado con el Ts local (329.74s, 1 proceso),
+el clúster real con 3 procesos en 3 máquinas distintas tardó 66.56s
+(~4.95x, superlineal otra vez por la posición de la llave en su
+segmento — mismo fenómeno ya documentado arriba, no una medida de
+eficiencia real). **Paso B completado y verificado.**
+
+### Ts medido con el binario actual (compilado con `DES_KEY_LAYOUT=1`)
+
+Sobre el rango completo `[0, 2^24)` contra `datos/cifrado_grupo7.des`:
+
+| Procesos | Tiempo (s) |
+| --- | --- |
+| 1 | 329.74 |
+| 2 | 111.49 |
+| 4 | 11.87 |
+
+Los speedups resultantes (2.96 y 27.79) salen superlineales — no es un error, es porque la llave real cae en una posición del rango que, al particionarse distinto según el número de procesos, le toca un segmento más corto a 4 procesos. No es una medida confiable de eficiencia real; para eso habría que promediar varias llaves distintas como en el benchmark de la Fase 1.
+
 ---
 
 ## Registro anterior del proyecto (conservado del commit remoto)
